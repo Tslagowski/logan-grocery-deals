@@ -26,6 +26,5 @@ jobs:
         run: node src/send-daily-grocery-report.mjs
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           DEAL_REPORT_TO_EMAIL: ${{ secrets.DEAL_REPORT_TO_EMAIL }}
-          DEAL_REPORT_FROM_EMAIL: ${{ secrets.DEAL_REPORT_FROM_EMAIL }}
