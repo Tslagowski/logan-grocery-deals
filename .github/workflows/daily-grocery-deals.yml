@@ -1,0 +1,31 @@
+name: Daily Grocery Deals
+
+on:
+  schedule:
+    # 8:00 AM Mountain during daylight time is 14:00 UTC.
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+
+jobs:
+  send-daily-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Send daily grocery report
+        run: node src/send-daily-grocery-report.mjs
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          DEAL_REPORT_TO_EMAIL: ${{ secrets.DEAL_REPORT_TO_EMAIL }}
+          DEAL_REPORT_FROM_EMAIL: ${{ secrets.DEAL_REPORT_FROM_EMAIL }}
