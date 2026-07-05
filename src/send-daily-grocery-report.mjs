@@ -10,23 +10,35 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 const dealSources = [
   {
-    storeName: "Smith's",
+    storeName: "Smith's Weekly Ad",
     url: 'https://www.smithsfoodanddrug.com/weeklyad',
   },
   {
-    storeName: "Macey's",
-    url: 'https://www.maceys.com/weekly-ad',
+    storeName: "Smith's Weekly Digital Deals",
+    url: 'https://www.smithsfoodanddrug.com/pr/weekly-digital-deals',
   },
   {
-    storeName: "Lee's Marketplace",
-    url: 'https://www.leesmarketplace.com/weekly-ad',
+    storeName: "Macey's Weekly Ad",
+    url: 'https://shop.maceys.com/store/maceys/flyers/weekly',
   },
   {
-    storeName: "Ridley's Family Market",
-    url: 'https://shopridleys.com/weekly-ad',
+    storeName: "Macey's Storefront Weekly Ad",
+    url: 'https://shop.maceys.com/store/maceys/storefront',
   },
   {
-    storeName: 'Costco',
+    storeName: "Lee's Marketplace Storefront",
+    url: 'https://shop.leesmarketplace.com/store/lees-marketplace/storefront',
+  },
+  {
+    storeName: "Lee's Marketplace Ad",
+    url: 'https://ad.leesmarketplace.com/',
+  },
+  {
+    storeName: "Ridley's RPerks Weekly Ad",
+    url: 'https://rperks.shopridleys.com/interactive-weekly-ad',
+  },
+  {
+    storeName: 'Costco Warehouse Savings',
     url: 'https://www.costco.com/warehouse-savings.html',
   },
   {
