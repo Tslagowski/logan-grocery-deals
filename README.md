@@ -15,6 +15,7 @@ Optional environment variable:
 - `OPENAI_SEARCH_MODEL` defaults to `OPENAI_MODEL`; use this for the web-search extraction model
 - `MAX_DEALS_PER_STORE` defaults to `20`
 - `ENABLE_SCREENSHOT_OCR` defaults to `true`; set to `false` to skip rendered-page screenshots and reduce cost
+- `SHOW_DEBUG_DETAILS` defaults to `false`; set to `true` to include full search sources and direct fetch diagnostics in the email
 
 The report uses three stages:
 

@@ -13,6 +13,7 @@ const openaiSearchModel =
 const sourceFetchConcurrency = 3;
 const storeSearchConcurrency = 2;
 const enableScreenshotOcr = optionalEnvironmentVariable('ENABLE_SCREENSHOT_OCR') !== 'false';
+const showDebugDetails = optionalEnvironmentVariable('SHOW_DEBUG_DETAILS') === 'true';
 const requestedMaxDealsPerStore = Number.parseInt(
   optionalEnvironmentVariable('MAX_DEALS_PER_STORE') ?? '20',
   10
@@ -784,30 +785,159 @@ function escapeMarkdownTableCell(value) {
     .trim();
 }
 
-function formatMarkdownTable(rows) {
-  if (rows.length === 0) {
-    return 'No specific item-level prices or deals were available from the target Logan sources.';
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function truncateText(value, maxLength = 140) {
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+function recommendationScore(recommendation) {
+  if (recommendation === 'Great deal') {
+    return 100;
   }
 
-  return [
-    '| Item | Store | Price/Discount | Expiration | Recommendation | Reason |',
-    '|------|-------|----------------|------------|----------------|--------|',
-    ...rows.map((deal) => {
-      const source = deal.sourceUrl ? ` Source: ${deal.sourceUrl}` : '';
-      return [
-        '',
-        deal.item,
-        deal.store,
-        deal.priceOrDiscount,
-        deal.expiration,
-        deal.recommendation,
-        `${deal.reason}${source}`,
-        '',
-      ]
-        .map(escapeMarkdownTableCell)
-        .join(' | ');
-    }),
-  ].join('\n');
+  if (recommendation === 'Good deal') {
+    return 70;
+  }
+
+  return 40;
+}
+
+function categorizeDeal(deal) {
+  const haystack = `${deal.item} ${deal.reason}`.toLowerCase();
+
+  if (/(chicken|beef|steak|roast|turkey|pork|ribs|shrimp|salmon|fish|sausage)/.test(haystack)) {
+    return 'Protein';
+  }
+
+  if (/(egg|yogurt|cottage cheese|protein shake|protein bar|protein powder|muscle milk|quest|built|oikos|core power)/.test(haystack)) {
+    return 'High-protein dairy and snacks';
+  }
+
+  if (/(blueberr|cherr|tomato|corn|salad|produce|fruit|vegetable)/.test(haystack)) {
+    return 'Produce';
+  }
+
+  if (/(water|sparkling|powerade|zero sugar|drink)/.test(haystack)) {
+    return 'Drinks';
+  }
+
+  if (/(toilet|paper towel|battery|batteries|vacuum|depend|poise|pull-ups|household)/.test(haystack)) {
+    return 'Household';
+  }
+
+  return 'Other';
+}
+
+function categoryScore(category) {
+  return {
+    Protein: 35,
+    'High-protein dairy and snacks': 30,
+    Produce: 20,
+    Household: 15,
+    Drinks: 10,
+    Other: 0,
+  }[category] ?? 0;
+}
+
+function dealSortScore(deal) {
+  const expirationPenalty = deal.expiration.toLowerCase().includes('verify') ? 5 : 0;
+  return recommendationScore(deal.recommendation) + categoryScore(categorizeDeal(deal)) - expirationPenalty;
+}
+
+function sortDealsForReading(deals) {
+  return [...deals].sort((firstDeal, secondDeal) => {
+    const scoreDifference = dealSortScore(secondDeal) - dealSortScore(firstDeal);
+
+    if (scoreDifference !== 0) {
+      return scoreDifference;
+    }
+
+    const storeDifference =
+      targetStores.indexOf(firstDeal.store) - targetStores.indexOf(secondDeal.store);
+
+    if (storeDifference !== 0) {
+      return storeDifference;
+    }
+
+    return firstDeal.item.localeCompare(secondDeal.item);
+  });
+}
+
+function groupDealsByStore(deals) {
+  return targetStores.map((storeName) => ({
+    storeName,
+    deals: sortDealsForReading(deals.filter((deal) => deal.store === storeName)),
+  }));
+}
+
+function groupDealsByCategory(deals) {
+  const categories = [
+    'Protein',
+    'High-protein dairy and snacks',
+    'Produce',
+    'Household',
+    'Drinks',
+    'Other',
+  ];
+
+  return categories
+    .map((category) => ({
+      category,
+      deals: sortDealsForReading(deals.filter((deal) => categorizeDeal(deal) === category)),
+    }))
+    .filter((group) => group.deals.length > 0);
+}
+
+function formatDealSource(deal) {
+  return deal.sourceUrl ? ` Source: ${deal.sourceUrl}` : '';
+}
+
+function formatDealBullet(deal) {
+  return `- [${deal.recommendation}] ${deal.item} - ${deal.priceOrDiscount}; expires ${deal.expiration}. ${truncateText(deal.reason, 180)}${formatDealSource(deal)}`;
+}
+
+function buildStoreSummary(storeSearchResults) {
+  return targetStores.map((storeName) => {
+    const storeResult = storeSearchResults.find((result) => result.targetStore === storeName);
+    const deals = storeResult?.deals ?? [];
+    const greatDealCount = deals.filter((deal) => deal.recommendation === 'Great deal').length;
+    const bestDeals = sortDealsForReading(deals)
+      .slice(0, 2)
+      .map((deal) => `${deal.item} (${deal.priceOrDiscount})`);
+
+    return {
+      storeName,
+      dealCount: deals.length,
+      greatDealCount,
+      status: storeResult?.status ?? 'not checked',
+      bestDeals,
+    };
+  });
+}
+
+function getNoteworthyNotes(storeSearchResults) {
+  return storeSearchResults.flatMap((storeResult) => {
+    const needsContext =
+      storeResult.deals.length === 0 ||
+      storeResult.status.includes('failed') ||
+      storeResult.status.includes('screenshot');
+
+    if (!needsContext) {
+      return [];
+    }
+
+    return storeResult.notes
+      .slice(0, 2)
+      .map((note) => `${storeResult.targetStore}: ${note}`);
+  });
 }
 
 function renderDebugDiagnostics(sourceResults) {
@@ -833,7 +963,7 @@ function renderDebugDiagnostics(sourceResults) {
   ].join('\n');
 }
 
-function renderSearchCoverage(storeSearchResults) {
+function renderSearchCoverageMarkdown(storeSearchResults) {
   return [
     '| Store | Search Status | Deals Found | Sources Seen | Error |',
     '|-------|---------------|-------------|--------------|-------|',
@@ -851,7 +981,7 @@ function renderSearchCoverage(storeSearchResults) {
   ].join('\n');
 }
 
-function renderSearchSources(storeSearchResults) {
+function renderSearchSourcesMarkdown(storeSearchResults) {
   const lines = storeSearchResults.flatMap((storeResult) => {
     if (storeResult.sources.length === 0) {
       return [];
@@ -866,50 +996,258 @@ function renderSearchSources(storeSearchResults) {
   return lines.length > 0 ? lines.join('\n') : 'No web-search source URLs were returned.';
 }
 
-function renderReport(sourceResults, storeSearchResults) {
+function getAllDeals(storeSearchResults) {
+  return sortDealsForReading(storeSearchResults.flatMap((storeResult) => storeResult.deals));
+}
+
+function renderTextReport(sourceResults, storeSearchResults) {
   const today = formatDateForReport();
-  const deals = storeSearchResults
-    .flatMap((storeResult) => storeResult.deals)
-    .sort(
-      (firstDeal, secondDeal) =>
-        targetStores.indexOf(firstDeal.store) - targetStores.indexOf(secondDeal.store)
-    );
+  const deals = getAllDeals(storeSearchResults);
   const storesWithDeals = new Set(deals.map((deal) => deal.store));
   const storesWithoutDeals = targetStores.filter((storeName) => !storesWithDeals.has(storeName));
-  const notes = storeSearchResults.flatMap((storeResult) =>
-    storeResult.notes.map((note) => `${storeResult.targetStore}: ${note}`)
-  );
+  const bestDeals = sortDealsForReading(deals).slice(0, 12);
+  const storeSummary = buildStoreSummary(storeSearchResults);
+  const categoryGroups = groupDealsByCategory(deals);
+  const storeGroups = groupDealsByStore(deals).filter((group) => group.deals.length > 0);
+  const noteworthyNotes = getNoteworthyNotes(storeSearchResults);
 
   return [
     '# Logan Grocery Deals',
     '',
     `Date checked: ${today}`,
+    `Deals found: ${deals.length} across ${storesWithDeals.size} stores.`,
+    storesWithoutDeals.length > 0
+      ? `No usable item prices found for: ${storesWithoutDeals.join(', ')}.`
+      : 'Usable item prices found for every target store.',
     '',
-    '## Specific Deals Found',
+    '## Best Deals First',
     '',
-    formatMarkdownTable(deals),
+    ...(bestDeals.length > 0
+      ? bestDeals.map((deal, index) => `${index + 1}. ${deal.store}: ${deal.item} - ${deal.priceOrDiscount} (${deal.recommendation}). ${truncateText(deal.reason, 160)}${formatDealSource(deal)}`)
+      : ['No specific item-level prices or deals were available from the target Logan sources.']),
     '',
-    '## Stores With No Usable Item Prices',
+    '## Store Summary',
     '',
-    ...storesWithoutDeals.map((storeName) => `- ${storeName}`),
+    ...storeSummary.map((summary) => {
+      const bestDealsText =
+        summary.bestDeals.length > 0 ? summary.bestDeals.join('; ') : 'No usable item prices';
+      return `- ${summary.storeName}: ${summary.dealCount} deals (${summary.greatDealCount} great). ${bestDealsText}.`;
+    }),
     '',
-    notes.length > 0 ? '## Notes' : '',
-    ...notes.map((note) => `- ${note}`),
-    notes.length > 0 ? '' : '',
+    '## Best Deals By Category',
+    '',
+    ...categoryGroups.flatMap((group) => [
+      `### ${group.category}`,
+      '',
+      ...group.deals.slice(0, 8).map(formatDealBullet),
+      '',
+    ]),
+    '## All Deals By Store',
+    '',
+    ...storeGroups.flatMap((group) => [
+      `### ${group.storeName} (${group.deals.length})`,
+      '',
+      ...group.deals.map(formatDealBullet),
+      '',
+    ]),
+    noteworthyNotes.length > 0 ? '## Data Quality Notes' : '',
+    ...noteworthyNotes.map((note) => `- ${note}`),
+    noteworthyNotes.length > 0 ? '' : '',
     '## Search Coverage',
     '',
-    renderSearchCoverage(storeSearchResults),
-    '',
-    '## Search Sources',
-    '',
-    renderSearchSources(storeSearchResults),
-    '',
-    '## Direct Source Diagnostics',
-    '',
-    renderDebugDiagnostics(sourceResults),
+    renderSearchCoverageMarkdown(storeSearchResults),
+    showDebugDetails ? '' : '',
+    showDebugDetails ? '## Search Sources' : '',
+    showDebugDetails ? '' : '',
+    showDebugDetails ? renderSearchSourcesMarkdown(storeSearchResults) : '',
+    showDebugDetails ? '' : '',
+    showDebugDetails ? '## Direct Source Diagnostics' : '',
+    showDebugDetails ? '' : '',
+    showDebugDetails ? renderDebugDiagnostics(sourceResults) : '',
   ]
     .filter((line, index, lines) => line !== '' || lines[index - 1] !== '')
     .join('\n');
+}
+
+function renderDealRowsHtml(deals, options = {}) {
+  const { includeStore = true, compact = false } = options;
+
+  if (deals.length === 0) {
+    return '<p style="margin: 8px 0 0; color: #6b7280;">No usable item-level prices found.</p>';
+  }
+
+  const headers = [
+    includeStore ? '<th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Store</th>' : '',
+    '<th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Item</th>',
+    '<th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Price</th>',
+    compact ? '' : '<th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Why</th>',
+  ].join('');
+
+  const rows = deals.map((deal) => {
+    const badgeColor = deal.recommendation === 'Great deal' ? '#166534' : '#374151';
+    const sourceLink = deal.sourceUrl
+      ? `<a href="${escapeHtml(deal.sourceUrl)}" style="color: #2563eb;">source</a>`
+      : '';
+
+    return `
+      <tr>
+        ${includeStore ? `<td style="padding: 8px; border-bottom: 1px solid #f3f4f6; vertical-align: top;">${escapeHtml(deal.store)}</td>` : ''}
+        <td style="padding: 8px; border-bottom: 1px solid #f3f4f6; vertical-align: top;">
+          <strong>${escapeHtml(deal.item)}</strong><br>
+          <span style="color: ${badgeColor}; font-size: 12px;">${escapeHtml(deal.recommendation)}</span>
+          <span style="color: #6b7280; font-size: 12px;"> · ${escapeHtml(deal.expiration)}</span>
+        </td>
+        <td style="padding: 8px; border-bottom: 1px solid #f3f4f6; vertical-align: top;">${escapeHtml(deal.priceOrDiscount)}</td>
+        ${compact ? '' : `<td style="padding: 8px; border-bottom: 1px solid #f3f4f6; vertical-align: top; color: #374151;">${escapeHtml(truncateText(deal.reason, 170))} ${sourceLink}</td>`}
+      </tr>
+    `;
+  }).join('');
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; font-size: 14px;">
+      <thead><tr>${headers}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderStoreSummaryHtml(storeSearchResults) {
+  const rows = buildStoreSummary(storeSearchResults).map((summary) => {
+    const bestDealsText =
+      summary.bestDeals.length > 0
+        ? summary.bestDeals.map(escapeHtml).join('<br>')
+        : '<span style="color: #9ca3af;">No usable item prices</span>';
+
+    return `
+      <tr>
+        <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;"><strong>${escapeHtml(summary.storeName)}</strong><br><span style="color: #6b7280; font-size: 12px;">${escapeHtml(summary.status)}</span></td>
+        <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${summary.dealCount}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${summary.greatDealCount}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${bestDealsText}</td>
+      </tr>
+    `;
+  }).join('');
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; font-size: 14px;">
+      <thead>
+        <tr>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Store</th>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Deals</th>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Great</th>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Best Finds</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderCoverageHtml(storeSearchResults) {
+  const rows = storeSearchResults.map((storeResult) => `
+    <tr>
+      <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${escapeHtml(storeResult.targetStore)}</td>
+      <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${escapeHtml(storeResult.status)}</td>
+      <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${storeResult.deals.length}</td>
+      <td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">${storeResult.sources.length}</td>
+    </tr>
+  `).join('');
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; font-size: 13px;">
+      <thead>
+        <tr>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Store</th>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Status</th>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Deals</th>
+          <th align="left" style="padding: 8px; border-bottom: 1px solid #e5e7eb;">Sources</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderHtmlReport(sourceResults, storeSearchResults) {
+  const today = formatDateForReport();
+  const deals = getAllDeals(storeSearchResults);
+  const bestDeals = deals.slice(0, 12);
+  const categoryGroups = groupDealsByCategory(deals);
+  const storeGroups = groupDealsByStore(deals).filter((group) => group.deals.length > 0);
+  const storesWithDeals = new Set(deals.map((deal) => deal.store));
+  const storesWithoutDeals = targetStores.filter((storeName) => !storesWithDeals.has(storeName));
+  const noteworthyNotes = getNoteworthyNotes(storeSearchResults);
+
+  return `
+<!doctype html>
+<html>
+  <body style="margin: 0; padding: 0; background: #f9fafb; color: #111827; font-family: Arial, sans-serif; line-height: 1.45;">
+    <div style="max-width: 920px; margin: 0 auto; padding: 24px 16px;">
+      <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px;">
+        <h1 style="margin: 0 0 4px; font-size: 24px;">Logan Grocery Deals</h1>
+        <p style="margin: 0; color: #6b7280;">${escapeHtml(today)} · ${deals.length} deals across ${storesWithDeals.size} stores</p>
+        ${storesWithoutDeals.length > 0 ? `<p style="margin: 12px 0 0; color: #92400e;">No usable item prices found for: ${escapeHtml(storesWithoutDeals.join(', '))}.</p>` : ''}
+      </div>
+
+      <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-top: 16px;">
+        <h2 style="margin: 0 0 12px; font-size: 18px;">Best Deals First</h2>
+        ${renderDealRowsHtml(bestDeals)}
+      </div>
+
+      <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-top: 16px;">
+        <h2 style="margin: 0 0 12px; font-size: 18px;">Store Summary</h2>
+        ${renderStoreSummaryHtml(storeSearchResults)}
+      </div>
+
+      <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-top: 16px;">
+        <h2 style="margin: 0 0 12px; font-size: 18px;">Best Deals By Category</h2>
+        ${categoryGroups.map((group) => `
+          <h3 style="margin: 18px 0 8px; font-size: 15px;">${escapeHtml(group.category)}</h3>
+          ${renderDealRowsHtml(group.deals.slice(0, 8), { compact: true })}
+        `).join('')}
+      </div>
+
+      <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-top: 16px;">
+        <h2 style="margin: 0 0 12px; font-size: 18px;">All Deals By Store</h2>
+        ${storeGroups.map((group) => `
+          <h3 style="margin: 18px 0 8px; font-size: 15px;">${escapeHtml(group.storeName)} (${group.deals.length})</h3>
+          ${renderDealRowsHtml(group.deals, { includeStore: false })}
+        `).join('')}
+      </div>
+
+      ${noteworthyNotes.length > 0 ? `
+        <div style="background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; padding: 20px; margin-top: 16px;">
+          <h2 style="margin: 0 0 8px; font-size: 18px;">Data Quality Notes</h2>
+          <ul style="margin: 0; padding-left: 20px;">
+            ${noteworthyNotes.map((note) => `<li>${escapeHtml(note)}</li>`).join('')}
+          </ul>
+        </div>
+      ` : ''}
+
+      <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-top: 16px;">
+        <h2 style="margin: 0 0 12px; font-size: 18px;">Search Coverage</h2>
+        ${renderCoverageHtml(storeSearchResults)}
+      </div>
+
+      ${showDebugDetails ? `
+        <div style="background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-top: 16px;">
+          <h2 style="margin: 0 0 12px; font-size: 18px;">Debug Details</h2>
+          <pre style="white-space: pre-wrap; font-family: Menlo, Consolas, monospace; font-size: 12px; color: #374151;">${escapeHtml(renderSearchSourcesMarkdown(storeSearchResults))}
+
+${escapeHtml(renderDebugDiagnostics(sourceResults))}</pre>
+        </div>
+      ` : ''}
+    </div>
+  </body>
+</html>
+`;
+}
+
+function renderReport(sourceResults, storeSearchResults) {
+  return {
+    text: renderTextReport(sourceResults, storeSearchResults),
+    html: renderHtmlReport(sourceResults, storeSearchResults),
+  };
 }
 
 async function buildReport(sourceResults) {
@@ -933,10 +1271,11 @@ async function fetchAllDealSources(browser) {
 
 
 function buildEmailHtml(report) {
-  const escapedReport = report
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
+  if (typeof report === 'object' && report.html) {
+    return report.html;
+  }
+
+  const escapedReport = escapeHtml(report);
 
   return `
 <!doctype html>
@@ -949,7 +1288,13 @@ function buildEmailHtml(report) {
 `;
 }
 
+function getReportText(report) {
+  return typeof report === 'object' && report.text ? report.text : report;
+}
+
 async function sendEmail(report) {
+  const reportText = getReportText(report);
+
   const today = new Date().toLocaleDateString('en-US', {
     timeZone: 'America/Denver',
     weekday: 'short',
@@ -961,7 +1306,7 @@ async function sendEmail(report) {
     from: 'Grocery Deals <onboarding@resend.dev>',
     to: process.env.DEAL_REPORT_TO_EMAIL,
     subject: `Logan Grocery Deals - ${today}`,
-    text: report,
+    text: reportText,
     html: buildEmailHtml(report),
   });
 
