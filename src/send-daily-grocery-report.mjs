@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { Resend } from 'resend';
+import { chromium } from 'playwright';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -52,28 +53,29 @@ function assertRequiredEnvironmentVariables() {
   }
 }
 
-async function fetchDealSourceText(source) {
+async function fetchDealSourceText(source, browser) {
+  const page = await browser.newPage();
+
   try {
-    const response = await fetch(source.url, {
-      headers: {
-        'user-agent': 'Mozilla/5.0 grocery-deal-checker',
-      },
+    await page.goto(source.url, {
+      waitUntil: 'networkidle',
+      timeout: 60000,
     });
 
-    if (!response.ok) {
-      return `${source.storeName}: Unable to fetch ${source.url}. Status ${response.status}`;
-    }
-
-    const html = await response.text();
+    const pageText = await page.locator('body').innerText({
+      timeout: 30000,
+    });
 
     return `
 STORE: ${source.storeName}
 URL: ${source.url}
-RAW_PAGE_TEXT:
-${html.slice(0, 12000)}
+PAGE_TEXT:
+${pageText.slice(0, 20000)}
 `;
   } catch (error) {
-    return `${source.storeName}: Unable to fetch ${source.url}. Error: ${error.message}`;
+    return `${source.storeName}: Unable to load ${source.url}. Error: ${error.message}`;
+  } finally {
+    await page.close();
   }
 }
 
@@ -154,13 +156,21 @@ async function sendEmail(report) {
 async function main() {
   assertRequiredEnvironmentVariables();
 
-  const sourceTexts = await Promise.all(
-    dealSources.map((source) => fetchDealSourceText(source))
-  );
+  const browser = await chromium.launch({
+    headless: true,
+  });
 
-  const report = await buildReport(sourceTexts);
+  try {
+    const sourceTexts = await Promise.all(
+      dealSources.map((source) => fetchDealSourceText(source, browser))
+    );
 
-  await sendEmail(report);
+    const report = await buildReport(sourceTexts);
+
+    await sendEmail(report);
+  } finally {
+    await browser.close();
+  }
 }
 
 main().catch((error) => {
