@@ -11,43 +11,89 @@ const openai = new OpenAI({
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+const targetStores = [
+  "Smith's Food and Drug",
+  "Macey's",
+  "Lee's Marketplace",
+  "Ridley's",
+  'Costco',
+  'Walmart Logan',
+];
+
+const targetStoreAliases = new Map([
+  ['smiths', "Smith's Food and Drug"],
+  ['smith s', "Smith's Food and Drug"],
+  ['smiths food and drug', "Smith's Food and Drug"],
+  ['smith s food and drug', "Smith's Food and Drug"],
+  ['kroger', "Smith's Food and Drug"],
+  ['maceys', "Macey's"],
+  ['macey s', "Macey's"],
+  ['lees', "Lee's Marketplace"],
+  ['lee s', "Lee's Marketplace"],
+  ['lees marketplace', "Lee's Marketplace"],
+  ['lee s marketplace', "Lee's Marketplace"],
+  ['ridleys', "Ridley's"],
+  ['ridley s', "Ridley's"],
+  ['costco', 'Costco'],
+  ['walmart', 'Walmart Logan'],
+  ['walmart logan', 'Walmart Logan'],
+]);
+
 const dealSources = [
   {
     storeName: "Smith's Weekly Ad",
+    targetStore: "Smith's Food and Drug",
     url: 'https://www.smithsfoodanddrug.com/weeklyad',
   },
   {
     storeName: "Smith's Weekly Digital Deals",
+    targetStore: "Smith's Food and Drug",
     url: 'https://www.smithsfoodanddrug.com/pr/weekly-digital-deals',
   },
   {
     storeName: "Macey's Weekly Ad",
+    targetStore: "Macey's",
     url: 'https://shop.maceys.com/store/maceys/flyers/weekly',
   },
   {
     storeName: "Macey's Storefront Weekly Ad",
+    targetStore: "Macey's",
     url: 'https://shop.maceys.com/store/maceys/storefront',
   },
   {
     storeName: "Lee's Marketplace Storefront",
+    targetStore: "Lee's Marketplace",
     url: 'https://shop.leesmarketplace.com/store/lees-marketplace/storefront',
   },
   {
     storeName: "Lee's Marketplace Ad",
+    targetStore: "Lee's Marketplace",
     url: 'https://ad.leesmarketplace.com/',
   },
   {
     storeName: "Ridley's RPerks Weekly Ad",
+    targetStore: "Ridley's",
     url: 'https://rperks.shopridleys.com/interactive-weekly-ad',
   },
   {
     storeName: 'Costco Warehouse Savings',
+    targetStore: 'Costco',
     url: 'https://www.costco.com/warehouse-savings.html',
   },
   {
     storeName: 'Walmart Logan',
+    targetStore: 'Walmart Logan',
     url: 'https://www.walmart.com/store/1888-logan-ut',
   },
+];
+
+const searchInstructions = [
+  'Smiths Food and Drug Logan Utah weekly ad digital deals chicken eggs produce household',
+  'Maceys Logan Utah weekly ad chicken produce household',
+  'Lees Marketplace Logan Utah weekly ad chicken produce household',
+  'Ridleys Logan Utah RPerks weekly ad chicken produce household',
+  'Costco Logan Utah warehouse savings grocery household',
+  'Walmart Logan Utah grocery deals chicken eggs produce household',
 ];
 
 function formatDateForReport() {
@@ -99,6 +145,46 @@ function compactText(text, maxLength = 18000) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength);
+}
+
+function normalizeStoreName(storeName) {
+  return storeName
+    .toLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function resolveTargetStoreName(storeName) {
+  const normalizedStoreName = normalizeStoreName(storeName);
+  const aliasMatch = targetStoreAliases.get(normalizedStoreName);
+
+  if (aliasMatch) {
+    return aliasMatch;
+  }
+
+  return targetStores.find((targetStore) => {
+    const normalizedTargetStore = normalizeStoreName(targetStore);
+    return (
+      normalizedStoreName === normalizedTargetStore ||
+      normalizedStoreName.includes(normalizedTargetStore) ||
+      normalizedTargetStore.includes(normalizedStoreName)
+    );
+  });
+}
+
+function extractJsonObject(text) {
+  const trimmedText = text.trim();
+  const fencedJsonMatch = trimmedText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const jsonText = fencedJsonMatch?.[1] ?? trimmedText;
+  const startIndex = jsonText.indexOf('{');
+  const endIndex = jsonText.lastIndexOf('}');
+
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    throw new Error('The model did not return a JSON object.');
+  }
+
+  return JSON.parse(jsonText.slice(startIndex, endIndex + 1));
 }
 
 async function fetchDealSource(source, browser) {
@@ -230,14 +316,17 @@ async function createReportWithWebSearch(sourceResults) {
       {
         role: 'system',
         content: `
-You create concise grocery deal reports for Logan, Utah.
+You find current item-level grocery and household deals for Logan, Utah.
 
 Only include specific item-level deals when actual item prices are present.
 Do not invent prices.
 Use web search to verify current public deals from official store pages, weekly ads, flyers, and public store pages.
-Prefer Logan, Utah stores and nearby Cache Valley stores.
+Only search for and report these target stores:
+${targetStores.map((storeName) => `- ${storeName}`).join('\n')}
+
+Never report Food Lion, Aldi, Lidl, Walgreens, Target, Albertsons, Safeway, Publix, or other non-target stores.
+Prefer official store pages. If an official page has no item prices, public weekly-ad mirrors are allowed only for target stores.
 If a deal is not clearly current, mark the expiration as "verify in ad" instead of guessing.
-Include a source URL for each deal in the Reason column.
 
 Prioritize:
 - chicken, lean beef, turkey, pork, fish, shrimp
@@ -247,31 +336,35 @@ Prioritize:
 - low-calorie sauces and zero-calorie drinks
 - household essentials
 
-Required report format:
-
-# Logan Grocery Deals
-
-Date checked: ${today}
-
-## Specific Deals Found
-Use a markdown table:
-Item | Store | Price/Discount | Expiration | Recommendation | Reason
-
-## Stores With No Usable Item Prices
-List each target store where neither the direct fetch nor web search found usable item-level prices.
-
-## Debug Source Diagnostics
-Use the supplied diagnostics. Include Store, URL, Status, Character Count, Real Weekly Ad Content, and Error if present.
+Return only a JSON object. Do not wrap it in markdown.
+Use this shape:
+{
+  "deals": [
+    {
+      "item": "string",
+      "store": "one target store name exactly",
+      "priceOrDiscount": "string",
+      "expiration": "string",
+      "recommendation": "Great deal | Good deal | Verify in ad",
+      "reason": "short reason",
+      "sourceUrl": "https://..."
+    }
+  ],
+  "notes": ["string"]
+}
 `,
       },
       {
         role: 'user',
         content: JSON.stringify(
           {
-            targetStores: dealSources.map((source) => source.storeName),
+            dateChecked: today,
+            targetStores,
+            suggestedSearches: searchInstructions,
             sourceDiagnostics,
             directFetchText: sourceResults.map((sourceResult) => ({
               storeName: sourceResult.storeName,
+              targetStore: sourceResult.targetStore,
               url: sourceResult.url,
               text: sourceResult.text,
             })),
@@ -294,39 +387,41 @@ async function createReportWithoutWebSearch(sourceResults) {
       {
         role: 'system',
         content: `
-You create concise grocery deal reports for Logan, Utah.
+You find current item-level grocery and household deals for Logan, Utah.
 
 Only include specific item-level deals when actual item prices are present in the supplied source text.
 Do not invent prices.
+Only report these target stores:
+${targetStores.map((storeName) => `- ${storeName}`).join('\n')}
 
-Required report format:
-
-# Logan Grocery Deals
-
-Date checked: ${today}
-
-## Specific Deals Found
-Use a markdown table:
-Item | Store | Price/Discount | Expiration | Recommendation | Reason
-
-## Stores With No Usable Item Prices
-List each target store where the direct fetch did not contain usable item-level prices.
-
-## Debug Source Diagnostics
-Use the supplied diagnostics. Include Store, URL, Status, Character Count, Real Weekly Ad Content, and Error if present.
-
-Add this note at the top of Debug Source Diagnostics:
-OpenAI web search fallback was unavailable for this run, so this report only used direct page fetches.
+Return only a JSON object. Do not wrap it in markdown.
+Use this shape:
+{
+  "deals": [
+    {
+      "item": "string",
+      "store": "one target store name exactly",
+      "priceOrDiscount": "string",
+      "expiration": "string",
+      "recommendation": "Great deal | Good deal | Verify in ad",
+      "reason": "short reason",
+      "sourceUrl": "https://..."
+    }
+  ],
+  "notes": ["OpenAI web search fallback was unavailable for this run, so this report only used direct page fetches."]
+}
 `,
       },
       {
         role: 'user',
         content: JSON.stringify(
           {
-            targetStores: dealSources.map((source) => source.storeName),
+            dateChecked: today,
+            targetStores,
             sourceDiagnostics,
             directFetchText: sourceResults.map((sourceResult) => ({
               storeName: sourceResult.storeName,
+              targetStore: sourceResult.targetStore,
               url: sourceResult.url,
               text: sourceResult.text,
             })),
@@ -339,14 +434,139 @@ OpenAI web search fallback was unavailable for this run, so this report only use
   });
 }
 
+function sanitizeDealCandidates(candidateReport) {
+  const deals = Array.isArray(candidateReport.deals) ? candidateReport.deals : [];
+
+  return deals
+    .map((deal) => {
+      const targetStore = resolveTargetStoreName(String(deal.store ?? ''));
+
+      if (!targetStore) {
+        return null;
+      }
+
+      return {
+        item: String(deal.item ?? '').trim(),
+        store: targetStore,
+        priceOrDiscount: String(deal.priceOrDiscount ?? '').trim(),
+        expiration: String(deal.expiration ?? 'verify in ad').trim(),
+        recommendation: String(deal.recommendation ?? 'Verify in ad').trim(),
+        reason: String(deal.reason ?? '').trim(),
+        sourceUrl: String(deal.sourceUrl ?? '').trim(),
+      };
+    })
+    .filter((deal) => deal?.item && deal.priceOrDiscount);
+}
+
+function escapeMarkdownTableCell(value) {
+  return String(value)
+    .replace(/\|/g, '\\|')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function formatMarkdownTable(rows) {
+  if (rows.length === 0) {
+    return 'No specific item-level prices or deals were available from the target Logan sources.';
+  }
+
+  return [
+    '| Item | Store | Price/Discount | Expiration | Recommendation | Reason |',
+    '|------|-------|----------------|------------|----------------|--------|',
+    ...rows.map((deal) => {
+      const source = deal.sourceUrl ? ` Source: ${deal.sourceUrl}` : '';
+      return [
+        '',
+        deal.item,
+        deal.store,
+        deal.priceOrDiscount,
+        deal.expiration,
+        deal.recommendation,
+        `${deal.reason}${source}`,
+        '',
+      ]
+        .map(escapeMarkdownTableCell)
+        .join(' | ');
+    }),
+  ].join('\n');
+}
+
+function renderDebugDiagnostics(sourceResults) {
+  return [
+    '| Store | URL | Status | Character Count | Real Weekly Ad Content | Error |',
+    '|-------|-----|--------|-----------------|------------------------|-------|',
+    ...sourceResults.map((sourceResult) => {
+      const error = sourceResult.error ? sourceResult.error.replace(/\s+/g, ' ') : '';
+      return [
+        '',
+        sourceResult.storeName,
+        sourceResult.url,
+        sourceResult.status,
+        sourceResult.characterCount,
+        sourceResult.realWeeklyAdContent ? 'Yes' : 'No',
+        error,
+        '',
+      ]
+        .map(escapeMarkdownTableCell)
+        .join(' | ');
+    }),
+  ].join('\n');
+}
+
+function renderReport(candidateReport, sourceResults) {
+  const today = formatDateForReport();
+  const deals = sanitizeDealCandidates(candidateReport);
+  const storesWithDeals = new Set(deals.map((deal) => deal.store));
+  const storesWithoutDeals = targetStores.filter((storeName) => !storesWithDeals.has(storeName));
+  const notes = Array.isArray(candidateReport.notes) ? candidateReport.notes.filter(Boolean) : [];
+
+  return [
+    '# Logan Grocery Deals',
+    '',
+    `Date checked: ${today}`,
+    '',
+    '## Specific Deals Found',
+    '',
+    formatMarkdownTable(deals),
+    '',
+    '## Stores With No Usable Item Prices',
+    '',
+    ...storesWithoutDeals.map((storeName) => `- ${storeName}`),
+    '',
+    notes.length > 0 ? '## Notes' : '',
+    ...notes.map((note) => `- ${note}`),
+    notes.length > 0 ? '' : '',
+    '## Debug Source Diagnostics',
+    '',
+    renderDebugDiagnostics(sourceResults),
+  ]
+    .filter((line, index, lines) => line !== '' || lines[index - 1] !== '')
+    .join('\n');
+}
+
 async function buildReport(sourceResults) {
   try {
     const response = await createReportWithWebSearch(sourceResults);
-    return response.output_text;
+    return renderReport(extractJsonObject(response.output_text), sourceResults);
   } catch (error) {
     console.warn(`OpenAI web search report failed; retrying without web search: ${error.message}`);
+  }
+
+  try {
     const response = await createReportWithoutWebSearch(sourceResults);
-    return response.output_text;
+    return renderReport(extractJsonObject(response.output_text), sourceResults);
+  } catch (error) {
+    console.warn(`Direct-fetch report parsing failed: ${error.message}`);
+
+    return renderReport(
+      {
+        deals: [],
+        notes: [
+          'OpenAI did not return parseable structured deals, so this report only includes source diagnostics.',
+        ],
+      },
+      sourceResults
+    );
   }
 }
 
