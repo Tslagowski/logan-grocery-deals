@@ -2,14 +2,19 @@ import OpenAI from 'openai';
 import { Resend } from 'resend';
 import { chromium } from 'playwright';
 
-const openaiModel = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
+function optionalEnvironmentVariable(name) {
+  const value = process.env[name]?.trim();
+  return value || undefined;
+}
+
+const openaiModel = optionalEnvironmentVariable('OPENAI_MODEL') ?? 'gpt-4.1-mini';
 const openaiSearchModel =
-  process.env.OPENAI_SEARCH_MODEL ?? process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
+  optionalEnvironmentVariable('OPENAI_SEARCH_MODEL') ?? openaiModel;
 const sourceFetchConcurrency = 3;
 const storeSearchConcurrency = 2;
-const enableScreenshotOcr = process.env.ENABLE_SCREENSHOT_OCR !== 'false';
+const enableScreenshotOcr = optionalEnvironmentVariable('ENABLE_SCREENSHOT_OCR') !== 'false';
 const requestedMaxDealsPerStore = Number.parseInt(
-  process.env.MAX_DEALS_PER_STORE ?? '20',
+  optionalEnvironmentVariable('MAX_DEALS_PER_STORE') ?? '20',
   10
 );
 const maxDealsPerStore =

@@ -31,3 +31,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           DEAL_REPORT_TO_EMAIL: ${{ secrets.DEAL_REPORT_TO_EMAIL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          OPENAI_SEARCH_MODEL: ${{ vars.OPENAI_SEARCH_MODEL }}
+          MAX_DEALS_PER_STORE: ${{ vars.MAX_DEALS_PER_STORE }}
+          ENABLE_SCREENSHOT_OCR: ${{ vars.ENABLE_SCREENSHOT_OCR }}
