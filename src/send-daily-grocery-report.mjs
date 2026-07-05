@@ -3,7 +3,19 @@ import { Resend } from 'resend';
 import { chromium } from 'playwright';
 
 const openaiModel = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
+const openaiSearchModel =
+  process.env.OPENAI_SEARCH_MODEL ?? process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
 const sourceFetchConcurrency = 3;
+const storeSearchConcurrency = 2;
+const enableScreenshotOcr = process.env.ENABLE_SCREENSHOT_OCR !== 'false';
+const requestedMaxDealsPerStore = Number.parseInt(
+  process.env.MAX_DEALS_PER_STORE ?? '20',
+  10
+);
+const maxDealsPerStore =
+  Number.isFinite(requestedMaxDealsPerStore) && requestedMaxDealsPerStore > 0
+    ? requestedMaxDealsPerStore
+    : 20;
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -87,14 +99,112 @@ const dealSources = [
   },
 ];
 
-const searchInstructions = [
-  'Smiths Food and Drug Logan Utah weekly ad digital deals chicken eggs produce household',
-  'Maceys Logan Utah weekly ad chicken produce household',
-  'Lees Marketplace Logan Utah weekly ad chicken produce household',
-  'Ridleys Logan Utah RPerks weekly ad chicken produce household',
-  'Costco Logan Utah warehouse savings grocery household',
-  'Walmart Logan Utah grocery deals chicken eggs produce household',
+const storeSearchConfigs = [
+  {
+    targetStore: "Smith's Food and Drug",
+    queries: [
+      "Smith's Food and Drug Logan Utah weekly ad item prices",
+      "Smith's Food and Drug Logan Utah weekly digital deals",
+      'Kroger Smiths Logan Utah weekly ad grocery prices',
+    ],
+    allowedDomains: ['smithsfoodanddrug.com', 'kroger.com', 'weekly-ads.us'],
+  },
+  {
+    targetStore: "Macey's",
+    queries: [
+      "Macey's Logan Utah weekly ad item prices",
+      "Macey's grocery weekly ad Logan Utah",
+    ],
+    allowedDomains: ['maceys.com', 'shop.maceys.com', 'weeklyad.io'],
+  },
+  {
+    targetStore: "Lee's Marketplace",
+    queries: [
+      "Lee's Marketplace Logan Utah weekly ad item prices",
+      "Lee's Marketplace Logan weekly ad grocery deals",
+    ],
+    allowedDomains: [
+      'leesmarketplace.com',
+      'shop.leesmarketplace.com',
+      'ad.leesmarketplace.com',
+    ],
+  },
+  {
+    targetStore: "Ridley's",
+    queries: [
+      "Ridley's Logan Utah RPerks weekly ad item prices",
+      "Ridley's Family Markets Logan Utah weekly ad grocery deals",
+    ],
+    allowedDomains: ['shopridleys.com', 'ridleys.com', 'rperks.shopridleys.com'],
+  },
+  {
+    targetStore: 'Costco',
+    queries: [
+      'Costco Logan Utah warehouse savings grocery household prices',
+      'Costco warehouse savings grocery household current deals',
+    ],
+    allowedDomains: ['costco.com'],
+  },
+  {
+    targetStore: 'Walmart Logan',
+    queries: [
+      'Walmart Logan Utah grocery deals item prices',
+      'Walmart store 1888 Logan Utah grocery deals',
+    ],
+    allowedDomains: ['walmart.com'],
+  },
 ];
+
+const blockedSearchDomains = [
+  'aldi.us',
+  'foodlion.com',
+  'lidl.com',
+  'publix.com',
+  'safeway.com',
+  'target.com',
+  'walgreens.com',
+];
+
+const dealSearchSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['targetStore', 'deals', 'notes'],
+  properties: {
+    targetStore: { type: 'string' },
+    deals: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'item',
+          'store',
+          'priceOrDiscount',
+          'expiration',
+          'recommendation',
+          'reason',
+          'sourceUrl',
+        ],
+        properties: {
+          item: { type: 'string' },
+          store: { type: 'string' },
+          priceOrDiscount: { type: 'string' },
+          expiration: { type: 'string' },
+          recommendation: {
+            type: 'string',
+            enum: ['Great deal', 'Good deal', 'Verify in ad'],
+          },
+          reason: { type: 'string' },
+          sourceUrl: { type: 'string' },
+        },
+      },
+    },
+    notes: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+  },
+};
 
 function formatDateForReport() {
   return new Date().toLocaleDateString('en-US', {
@@ -187,8 +297,35 @@ function extractJsonObject(text) {
   return JSON.parse(jsonText.slice(startIndex, endIndex + 1));
 }
 
+async function capturePageScreenshots(page) {
+  if (!enableScreenshotOcr) {
+    return [];
+  }
+
+  try {
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(1000);
+
+    const screenshot = await page.screenshot({
+      type: 'jpeg',
+      quality: 60,
+      fullPage: false,
+    });
+
+    return [`data:image/jpeg;base64,${screenshot.toString('base64')}`];
+  } catch (error) {
+    console.warn(`Screenshot capture failed: ${error.message}`);
+    return [];
+  }
+}
+
 async function fetchDealSource(source, browser) {
-  const page = await browser.newPage();
+  const page = await browser.newPage({
+    viewport: {
+      width: 1280,
+      height: 1600,
+    },
+  });
   const startedAt = Date.now();
 
   try {
@@ -235,6 +372,7 @@ async function fetchDealSource(source, browser) {
         metadata.images.length > 0 ? `Image labels: ${metadata.images.join(' | ')}` : '',
       ].join('\n')
     );
+    const screenshots = await capturePageScreenshots(page);
 
     return {
       ...source,
@@ -244,6 +382,7 @@ async function fetchDealSource(source, browser) {
       elapsedMs: Date.now() - startedAt,
       realWeeklyAdContent: looksLikeWeeklyAdText(combinedText),
       text: combinedText,
+      screenshots,
     };
   } catch (error) {
     return {
@@ -254,6 +393,7 @@ async function fetchDealSource(source, browser) {
       elapsedMs: Date.now() - startedAt,
       realWeeklyAdContent: false,
       text: '',
+      screenshots: [],
       error: error.message,
     };
   } finally {
@@ -288,45 +428,159 @@ function buildSourceDiagnostics(sourceResults) {
     characterCount: sourceResult.characterCount,
     elapsedMs: sourceResult.elapsedMs,
     realWeeklyAdContent: sourceResult.realWeeklyAdContent,
+    screenshotCount: sourceResult.screenshots.length,
     error: sourceResult.error,
     preview: sourceResult.text.slice(0, 1000),
   }));
 }
 
-async function createReportWithWebSearch(sourceResults) {
-  const today = formatDateForReport();
-  const sourceDiagnostics = buildSourceDiagnostics(sourceResults);
+function getSourceResultsForStore(sourceResults, targetStore) {
+  return sourceResults.filter((sourceResult) => sourceResult.targetStore === targetStore);
+}
+
+function extractResponseUrls(response) {
+  const urls = new Set();
+
+  function visit(value) {
+    if (!value) {
+      return;
+    }
+
+    if (typeof value === 'string') {
+      if (/^https?:\/\//i.test(value)) {
+        urls.add(value);
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+
+    if (typeof value === 'object') {
+      Object.values(value).forEach(visit);
+    }
+  }
+
+  visit(response.output);
+  return Array.from(urls).slice(0, 30);
+}
+
+function isAllowedSourceUrl(sourceUrl, allowedDomains) {
+  if (!sourceUrl) {
+    return false;
+  }
+
+  try {
+    const hostname = new URL(sourceUrl).hostname.replace(/^www\./, '');
+    return allowedDomains.some((domain) => {
+      const normalizedDomain = domain.replace(/^www\./, '');
+      return hostname === normalizedDomain || hostname.endsWith(`.${normalizedDomain}`);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeStoreDealCandidates(candidateReport, storeConfig) {
+  return sanitizeDealCandidates(candidateReport)
+    .filter((deal) => deal.store === storeConfig.targetStore)
+    .filter((deal) => isAllowedSourceUrl(deal.sourceUrl, storeConfig.allowedDomains))
+    .slice(0, maxDealsPerStore);
+}
+
+function buildStoreInputContent(storeConfig, storeSourceResults, sourceDiagnostics, includeScreenshots) {
+  const content = [
+    {
+      type: 'input_text',
+      text: JSON.stringify(
+        {
+          dateChecked: formatDateForReport(),
+          targetStore: storeConfig.targetStore,
+          searchQueries: storeConfig.queries,
+          allowedDomains: storeConfig.allowedDomains,
+          sourceDiagnostics,
+          directFetchText: storeSourceResults.map((sourceResult) => ({
+            storeName: sourceResult.storeName,
+            targetStore: sourceResult.targetStore,
+            url: sourceResult.url,
+            text: sourceResult.text,
+          })),
+        },
+        null,
+        2
+      ),
+    },
+  ];
+
+  if (!includeScreenshots) {
+    return content;
+  }
+
+  for (const sourceResult of storeSourceResults) {
+    sourceResult.screenshots.forEach((screenshot, screenshotIndex) => {
+      content.push({
+        type: 'input_text',
+        text: `Rendered screenshot ${screenshotIndex + 1} from ${sourceResult.storeName}: ${sourceResult.url}. Use this URL as sourceUrl for deals found visually in this screenshot.`,
+      });
+      content.push({
+        type: 'input_image',
+        image_url: screenshot,
+      });
+    });
+  }
+
+  return content;
+}
+
+async function createStoreWebSearch(storeConfig, sourceResults) {
+  const storeSourceResults = getSourceResultsForStore(sourceResults, storeConfig.targetStore);
+  const sourceDiagnostics = buildSourceDiagnostics(storeSourceResults);
 
   return openai.responses.create({
-    model: openaiModel,
+    model: openaiSearchModel,
     tools: [
       {
         type: 'web_search',
-        search_context_size: 'medium',
+        search_context_size: 'high',
+        filters: {
+          allowed_domains: storeConfig.allowedDomains,
+          blocked_domains: blockedSearchDomains,
+        },
         user_location: {
           type: 'approximate',
           country: 'US',
           region: 'Utah',
           city: 'Logan',
+          timezone: 'America/Denver',
         },
       },
     ],
     tool_choice: 'required',
+    include: ['web_search_call.action.sources'],
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'store_deal_search',
+        strict: true,
+        schema: dealSearchSchema,
+      },
+    },
     input: [
       {
         role: 'system',
         content: `
-You find current item-level grocery and household deals for Logan, Utah.
+You find current item-level grocery and household deals for ${storeConfig.targetStore} in Logan, Utah.
 
 Only include specific item-level deals when actual item prices are present.
 Do not invent prices.
-Use web search to verify current public deals from official store pages, weekly ads, flyers, and public store pages.
-Only search for and report these target stores:
-${targetStores.map((storeName) => `- ${storeName}`).join('\n')}
-
-Never report Food Lion, Aldi, Lidl, Walgreens, Target, Albertsons, Safeway, Publix, or other non-target stores.
-Prefer official store pages. If an official page has no item prices, public weekly-ad mirrors are allowed only for target stores.
+Search only for ${storeConfig.targetStore}. Ignore every other retailer.
+Use official store pages first. Public weekly-ad mirrors are acceptable only when they clearly refer to ${storeConfig.targetStore}.
 If a deal is not clearly current, mark the expiration as "verify in ad" instead of guessing.
+Return up to ${maxDealsPerStore} item-level deals for this store.
+Do not return generic rows like "various deals", "weekly ad", or "storewide sale".
+Every deal must include a sourceUrl from one of the allowed domains.
 
 Prioritize:
 - chicken, lean beef, turkey, pork, fish, shrimp
@@ -336,102 +590,162 @@ Prioritize:
 - low-calorie sauces and zero-calorie drinks
 - household essentials
 
-Return only a JSON object. Do not wrap it in markdown.
-Use this shape:
-{
-  "deals": [
-    {
-      "item": "string",
-      "store": "one target store name exactly",
-      "priceOrDiscount": "string",
-      "expiration": "string",
-      "recommendation": "Great deal | Good deal | Verify in ad",
-      "reason": "short reason",
-      "sourceUrl": "https://..."
-    }
-  ],
-  "notes": ["string"]
-}
+Return JSON that matches the provided schema.
 `,
       },
       {
         role: 'user',
-        content: JSON.stringify(
-          {
-            dateChecked: today,
-            targetStores,
-            suggestedSearches: searchInstructions,
-            sourceDiagnostics,
-            directFetchText: sourceResults.map((sourceResult) => ({
-              storeName: sourceResult.storeName,
-              targetStore: sourceResult.targetStore,
-              url: sourceResult.url,
-              text: sourceResult.text,
-            })),
-          },
-          null,
-          2
+        content: buildStoreInputContent(
+          storeConfig,
+          storeSourceResults,
+          sourceDiagnostics,
+          false
         ),
       },
     ],
   });
 }
 
-async function createReportWithoutWebSearch(sourceResults) {
-  const today = formatDateForReport();
-  const sourceDiagnostics = buildSourceDiagnostics(sourceResults);
+async function createStoreDirectExtraction(storeConfig, sourceResults) {
+  const storeSourceResults = getSourceResultsForStore(sourceResults, storeConfig.targetStore);
+  const sourceDiagnostics = buildSourceDiagnostics(storeSourceResults);
 
   return openai.responses.create({
     model: openaiModel,
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'store_deal_direct_extract',
+        strict: true,
+        schema: dealSearchSchema,
+      },
+    },
     input: [
       {
         role: 'system',
         content: `
-You find current item-level grocery and household deals for Logan, Utah.
+You extract current item-level grocery and household deals for ${storeConfig.targetStore} in Logan, Utah from supplied source text.
 
 Only include specific item-level deals when actual item prices are present in the supplied source text.
 Do not invent prices.
-Only report these target stores:
-${targetStores.map((storeName) => `- ${storeName}`).join('\n')}
-
-Return only a JSON object. Do not wrap it in markdown.
-Use this shape:
-{
-  "deals": [
-    {
-      "item": "string",
-      "store": "one target store name exactly",
-      "priceOrDiscount": "string",
-      "expiration": "string",
-      "recommendation": "Great deal | Good deal | Verify in ad",
-      "reason": "short reason",
-      "sourceUrl": "https://..."
-    }
-  ],
-  "notes": ["OpenAI web search fallback was unavailable for this run, so this report only used direct page fetches."]
-}
+Only report ${storeConfig.targetStore}.
+Use screenshots when source text is thin or looks like an app shell.
+Return up to ${maxDealsPerStore} item-level deals.
+Return JSON that matches the provided schema.
 `,
       },
       {
         role: 'user',
-        content: JSON.stringify(
-          {
-            dateChecked: today,
-            targetStores,
-            sourceDiagnostics,
-            directFetchText: sourceResults.map((sourceResult) => ({
-              storeName: sourceResult.storeName,
-              targetStore: sourceResult.targetStore,
-              url: sourceResult.url,
-              text: sourceResult.text,
-            })),
-          },
-          null,
-          2
+        content: buildStoreInputContent(
+          storeConfig,
+          storeSourceResults,
+          sourceDiagnostics,
+          true
         ),
       },
     ],
   });
+}
+
+function mergeDeals(dealGroups) {
+  const seenDeals = new Set();
+  const mergedDeals = [];
+
+  for (const deal of dealGroups.flat()) {
+    const dealKey = [
+      normalizeStoreName(deal.store),
+      normalizeStoreName(deal.item),
+      normalizeStoreName(deal.priceOrDiscount),
+    ].join('|');
+
+    if (seenDeals.has(dealKey)) {
+      continue;
+    }
+
+    seenDeals.add(dealKey);
+    mergedDeals.push(deal);
+  }
+
+  return mergedDeals.slice(0, maxDealsPerStore);
+}
+
+async function searchStoreDeals(storeConfig, sourceResults) {
+  let webSearchResult;
+
+  try {
+    const response = await createStoreWebSearch(storeConfig, sourceResults);
+    const candidateReport = extractJsonObject(response.output_text);
+    const deals = sanitizeStoreDealCandidates(candidateReport, storeConfig);
+
+    webSearchResult = {
+      targetStore: storeConfig.targetStore,
+      status: 'web search',
+      deals,
+      notes: Array.isArray(candidateReport.notes) ? candidateReport.notes : [],
+      sources: extractResponseUrls(response),
+      error: '',
+    };
+  } catch (error) {
+    console.warn(`${storeConfig.targetStore}: web search failed; trying direct extraction: ${error.message}`);
+  }
+
+  if (webSearchResult && (!enableScreenshotOcr || webSearchResult.deals.length >= 3)) {
+    return webSearchResult;
+  }
+
+  try {
+    const response = await createStoreDirectExtraction(storeConfig, sourceResults);
+    const candidateReport = extractJsonObject(response.output_text);
+    const directDeals = sanitizeStoreDealCandidates(candidateReport, storeConfig);
+    const deals = mergeDeals([webSearchResult?.deals ?? [], directDeals]);
+
+    return {
+      targetStore: storeConfig.targetStore,
+      status: webSearchResult ? 'web search + screenshot OCR' : 'direct screenshot OCR',
+      deals,
+      notes: [
+        ...(webSearchResult?.notes ?? []),
+        ...(webSearchResult ? [] : ['Web search failed for this store.']),
+        ...(Array.isArray(candidateReport.notes) ? candidateReport.notes : []),
+      ],
+      sources: webSearchResult?.sources ?? [],
+      error: '',
+    };
+  } catch (error) {
+    if (webSearchResult) {
+      return {
+        ...webSearchResult,
+        status: 'web search; screenshot OCR failed',
+        notes: [
+          ...webSearchResult.notes,
+          `Screenshot OCR failed for this store: ${error.message}`,
+        ],
+      };
+    }
+
+    return {
+      targetStore: storeConfig.targetStore,
+      status: 'failed',
+      deals: [],
+      notes: ['No structured deal data could be extracted for this store.'],
+      sources: [],
+      error: error.message,
+    };
+  }
+}
+
+async function searchAllStores(sourceResults) {
+  return mapWithConcurrency(
+    storeSearchConfigs,
+    storeSearchConcurrency,
+    async (storeConfig) => {
+      const result = await searchStoreDeals(storeConfig, sourceResults);
+      console.log(
+        `${result.targetStore}: ${result.status}, deals=${result.deals.length}, sources=${result.sources.length}`
+      );
+      return result;
+    }
+  );
 }
 
 function sanitizeDealCandidates(candidateReport) {
@@ -493,8 +807,8 @@ function formatMarkdownTable(rows) {
 
 function renderDebugDiagnostics(sourceResults) {
   return [
-    '| Store | URL | Status | Character Count | Real Weekly Ad Content | Error |',
-    '|-------|-----|--------|-----------------|------------------------|-------|',
+    '| Store | URL | Status | Character Count | Screenshots | Real Weekly Ad Content | Error |',
+    '|-------|-----|--------|-----------------|-------------|------------------------|-------|',
     ...sourceResults.map((sourceResult) => {
       const error = sourceResult.error ? sourceResult.error.replace(/\s+/g, ' ') : '';
       return [
@@ -503,6 +817,7 @@ function renderDebugDiagnostics(sourceResults) {
         sourceResult.url,
         sourceResult.status,
         sourceResult.characterCount,
+        sourceResult.screenshots.length,
         sourceResult.realWeeklyAdContent ? 'Yes' : 'No',
         error,
         '',
@@ -513,12 +828,52 @@ function renderDebugDiagnostics(sourceResults) {
   ].join('\n');
 }
 
-function renderReport(candidateReport, sourceResults) {
+function renderSearchCoverage(storeSearchResults) {
+  return [
+    '| Store | Search Status | Deals Found | Sources Seen | Error |',
+    '|-------|---------------|-------------|--------------|-------|',
+    ...storeSearchResults.map((storeResult) => [
+      '',
+      storeResult.targetStore,
+      storeResult.status,
+      storeResult.deals.length,
+      storeResult.sources.length,
+      storeResult.error,
+      '',
+    ]
+      .map(escapeMarkdownTableCell)
+      .join(' | ')),
+  ].join('\n');
+}
+
+function renderSearchSources(storeSearchResults) {
+  const lines = storeSearchResults.flatMap((storeResult) => {
+    if (storeResult.sources.length === 0) {
+      return [];
+    }
+
+    return [
+      `- ${storeResult.targetStore}:`,
+      ...storeResult.sources.slice(0, 8).map((sourceUrl) => `  - ${sourceUrl}`),
+    ];
+  });
+
+  return lines.length > 0 ? lines.join('\n') : 'No web-search source URLs were returned.';
+}
+
+function renderReport(sourceResults, storeSearchResults) {
   const today = formatDateForReport();
-  const deals = sanitizeDealCandidates(candidateReport);
+  const deals = storeSearchResults
+    .flatMap((storeResult) => storeResult.deals)
+    .sort(
+      (firstDeal, secondDeal) =>
+        targetStores.indexOf(firstDeal.store) - targetStores.indexOf(secondDeal.store)
+    );
   const storesWithDeals = new Set(deals.map((deal) => deal.store));
   const storesWithoutDeals = targetStores.filter((storeName) => !storesWithDeals.has(storeName));
-  const notes = Array.isArray(candidateReport.notes) ? candidateReport.notes.filter(Boolean) : [];
+  const notes = storeSearchResults.flatMap((storeResult) =>
+    storeResult.notes.map((note) => `${storeResult.targetStore}: ${note}`)
+  );
 
   return [
     '# Logan Grocery Deals',
@@ -536,7 +891,15 @@ function renderReport(candidateReport, sourceResults) {
     notes.length > 0 ? '## Notes' : '',
     ...notes.map((note) => `- ${note}`),
     notes.length > 0 ? '' : '',
-    '## Debug Source Diagnostics',
+    '## Search Coverage',
+    '',
+    renderSearchCoverage(storeSearchResults),
+    '',
+    '## Search Sources',
+    '',
+    renderSearchSources(storeSearchResults),
+    '',
+    '## Direct Source Diagnostics',
     '',
     renderDebugDiagnostics(sourceResults),
   ]
@@ -545,29 +908,8 @@ function renderReport(candidateReport, sourceResults) {
 }
 
 async function buildReport(sourceResults) {
-  try {
-    const response = await createReportWithWebSearch(sourceResults);
-    return renderReport(extractJsonObject(response.output_text), sourceResults);
-  } catch (error) {
-    console.warn(`OpenAI web search report failed; retrying without web search: ${error.message}`);
-  }
-
-  try {
-    const response = await createReportWithoutWebSearch(sourceResults);
-    return renderReport(extractJsonObject(response.output_text), sourceResults);
-  } catch (error) {
-    console.warn(`Direct-fetch report parsing failed: ${error.message}`);
-
-    return renderReport(
-      {
-        deals: [],
-        notes: [
-          'OpenAI did not return parseable structured deals, so this report only includes source diagnostics.',
-        ],
-      },
-      sourceResults
-    );
-  }
+  const storeSearchResults = await searchAllStores(sourceResults);
+  return renderReport(sourceResults, storeSearchResults);
 }
 
 async function fetchAllDealSources(browser) {
@@ -629,16 +971,16 @@ async function main() {
   const browser = await chromium.launch({
     headless: true,
   });
+  let sourceResults;
 
   try {
-    const sourceResults = await fetchAllDealSources(browser);
-
-    const report = await buildReport(sourceResults);
-
-    await sendEmail(report);
+    sourceResults = await fetchAllDealSources(browser);
   } finally {
     await browser.close();
   }
+
+  const report = await buildReport(sourceResults);
+  await sendEmail(report);
 }
 
 main().catch((error) => {

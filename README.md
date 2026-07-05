@@ -12,11 +12,18 @@ Required repository secrets:
 Optional environment variable:
 
 - `OPENAI_MODEL` defaults to `gpt-4.1-mini`
+- `OPENAI_SEARCH_MODEL` defaults to `OPENAI_MODEL`; use this for the web-search extraction model
+- `MAX_DEALS_PER_STORE` defaults to `20`
+- `ENABLE_SCREENSHOT_OCR` defaults to `true`; set to `false` to skip rendered-page screenshots and reduce cost
 
-The report uses two inputs:
+The report uses three stages:
 
 - Direct Playwright fetches of target store weekly ad pages, with source diagnostics.
-- OpenAI Responses API web search to find current public item-level prices when store pages render as JavaScript shells or block automation.
+- Store-by-store OpenAI Responses API web search using allowed domains for each Logan-area target store.
+- Screenshot/OCR extraction when web search finds fewer than three deals for a store.
+- Deterministic report rendering from structured deal candidates, search coverage, search sources, and direct source diagnostics.
+
+For better coverage, set `OPENAI_SEARCH_MODEL` to a stronger web-search-capable model available on the API key. The default keeps the action inexpensive, but deeper search generally needs a stronger model and more latency.
 
 Run a local syntax check with:
 
