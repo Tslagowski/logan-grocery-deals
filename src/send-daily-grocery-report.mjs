@@ -80,6 +80,19 @@ ${pageText.slice(0, 20000)}
 }
 
 async function buildReport(sourceTexts) {
+  const sourceDiagnostics = sourceTexts
+    .map((sourceText) => {
+      const storeMatch = sourceText.match(/STORE:\s*(.*)/);
+      const urlMatch = sourceText.match(/URL:\s*(.*)/);
+
+      return {
+        storeName: storeMatch?.[1] ?? 'Unknown store',
+        url: urlMatch?.[1] ?? 'Unknown URL',
+        characterCount: sourceText.length,
+        preview: sourceText.slice(0, 1200),
+      };
+    });
+
   const response = await openai.responses.create({
     model: 'gpt-4.1-mini',
     input: [
@@ -88,26 +101,46 @@ async function buildReport(sourceTexts) {
         content: `
 You create concise grocery deal reports for Logan, Utah.
 
-Only include specific item-level deals.
-Do not include generic store summaries.
-Prioritize weight-lifting nutrition:
+Only include specific item-level deals when actual item prices are present.
+Do not invent prices.
+
+Prioritize:
 - chicken, lean beef, turkey, pork, fish, shrimp
 - eggs, Greek yogurt, cottage cheese
-- protein shakes and bars only when legitimately discounted
+- protein shakes and bars
 - fruits, vegetables
 - low-calorie sauces and zero-calorie drinks
 - household essentials
 
-For each deal include:
-Item | Store | Price/Discount | Expiration if known | Buy/Skip/Stock-up | Reason
+Required report format:
 
-If the source text does not contain specific item-level pricing, say that specific item-level deals were unavailable for that store.
-Do not invent prices.
+# Logan Grocery Deals
+
+## Specific Deals Found
+Use a markdown table:
+Item | Store | Price/Discount | Expiration | Recommendation | Reason
+
+## Stores With No Usable Item Prices
+List each store where the page loaded but no item-level prices were visible.
+
+## Debug Source Diagnostics
+For each source, include:
+- Store
+- URL
+- Character count
+- Whether page text looked like real weekly ad content or just a site shell
 `,
       },
       {
         role: 'user',
-        content: sourceTexts.join('\n\n'),
+        content: JSON.stringify(
+          {
+            sourceDiagnostics,
+            fullSourceTexts: sourceTexts,
+          },
+          null,
+          2
+        ),
       },
     ],
   });
